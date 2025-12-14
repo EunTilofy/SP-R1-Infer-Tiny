@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import re
 import argparse
 from dataclasses import dataclass
@@ -16,10 +13,8 @@ from transformers import (
 
 from prompts import infer_prompt
 
-# NOTE: This script forces FULL-GPU placement.
-# It will raise an error if the model cannot fit entirely on GPUs (no CPU/disk offload).
 try:
-    from accelerate import infer_auto_device_map
+    from accelerate import infer_auto_device_map, init_empty_weights
     from accelerate.utils import get_balanced_memory
 except Exception as e:
     raise ImportError(
@@ -27,9 +22,10 @@ except Exception as e:
         "  pip install accelerate\n"
     ) from e
 
+STOP_TAGS_FOR_STOPPING = ["<search>", "</search>", "</backtrack>", "</summary>", "</answer>"]
+CLOSE_TAGS = ["</search>", "</backtrack>", "</summary>", "</answer>"]
 
-STOP_STRS = ["</search>", "</backtrack>", "</summary>", "</answer>"]
-MODEL_TAGS = ["think", "answer", "summary", "backtrack", "search"]  # allowed model actions
+MODEL_TAGS = ["think", "answer", "summary", "backtrack", "search"]
 
 
 def Search(_: str) -> str:
@@ -37,21 +33,13 @@ def Search(_: str) -> str:
 
 
 def configure_tf32_no_deprecated_warning() -> None:
-    """
-    Configure TF32 using the NEW PyTorch API so the deprecated allow_tf32 warning will NOT be triggered.
-    """
     if not torch.cuda.is_available():
         return
-
-    # New API (PyTorch mainline): will not trigger the allow_tf32 deprecation warning.
-    # If your PyTorch build does not yet have these attributes, we safely skip.
     try:
         torch.backends.cuda.matmul.fp32_precision = "tf32"
         torch.backends.cudnn.conv.fp32_precision = "tf32"
     except Exception:
         pass
-
-    # Also safe, not part of deprecated TF32 toggles.
     try:
         torch.set_float32_matmul_precision("high")
     except Exception:
@@ -59,15 +47,10 @@ def configure_tf32_no_deprecated_warning() -> None:
 
 
 class ActionTagStoppingCriteria(StoppingCriteria):
-    """
-    Token-level stopping criteria:
-    stop when the generated sequence ends with any closing tag (with common whitespace/newline variants).
-    """
-
     def __init__(
         self,
         tokenizer: Any,
-        stop_tags: List[str] = STOP_STRS,
+        stop_tags: List[str],
         max_prefix_ws: int = 2,
         max_suffix_nl: int = 2,
         include_crlf: bool = True,
@@ -91,7 +74,6 @@ class ActionTagStoppingCriteria(StoppingCriteria):
             suffixes += ["\r\n", "\r\n\r\n"]
         suffixes = list(dict.fromkeys(suffixes))
 
-        # buckets[length] = list[(tag, ids_tensor_cpu)]
         buckets: Dict[int, List[Tuple[str, torch.Tensor]]] = {}
         for tag in stop_tags:
             for pre in ws_prefixes:
@@ -106,12 +88,7 @@ class ActionTagStoppingCriteria(StoppingCriteria):
         self.lengths = sorted(buckets.keys())
         self.buckets = buckets
 
-    def __call__(
-        self,
-        input_ids: torch.LongTensor,
-        scores: torch.FloatTensor,
-        **kwargs: Any,
-    ) -> bool:
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs: Any) -> bool:
         self.triggered_tag = None
         _, seq_len = input_ids.shape
         device = input_ids.device
@@ -119,7 +96,7 @@ class ActionTagStoppingCriteria(StoppingCriteria):
         for L in self.lengths:
             if seq_len < L:
                 continue
-            tail = input_ids[:, -L:]  # [B, L]
+            tail = input_ids[:, -L:]
             for tag, ids_cpu in self.buckets[L]:
                 ids = ids_cpu.to(device)
                 if (tail == ids).all(dim=1).any():
@@ -136,6 +113,16 @@ class GenConfig:
     do_sample: bool = False
 
 
+@dataclass
+class SearchConfig:
+    num_paths: int = 3
+    max_new_tokens: int = 96
+    temperature: float = 1.0
+    top_p: float = 0.5
+    repetition_penalty: float = 1.1
+    no_repeat_ngram_size: int = 3
+
+
 class ProtocolRunner:
     def __init__(
         self,
@@ -144,13 +131,10 @@ class ProtocolRunner:
         attn_impl: str = "sdpa",
         reserve_gib: float = 1.5,
         balanced_low_0: bool = False,
+        search_cfg: Optional[SearchConfig] = None,
     ):
-        """
-        FULL-GPU loader:
-          - infers a device_map using ONLY GPU memory budgets
-          - refuses CPU/disk offload (raises error if needed)
-        """
         self.model_dir = model_dir
+        self.search_cfg = search_cfg or SearchConfig()
 
         configure_tf32_no_deprecated_warning()
 
@@ -175,40 +159,34 @@ class ProtocolRunner:
         if n_gpu == 0:
             raise RuntimeError("No CUDA device found, cannot run fully on GPU.")
 
-        # Build GPU-only max_memory budget (no "cpu" entry!) -> prevents offloading.
-        max_memory: Dict[int, int] = {}
         reserve = int(reserve_gib * 1024**3)
+        max_memory: Dict[int, int] = {}
         for i in range(n_gpu):
             total = torch.cuda.get_device_properties(i).total_memory
             avail = max(total - reserve, int(0.5 * 1024**3))
             max_memory[i] = avail
-
-        # First load once without device_map to infer placement.
-        # low_cpu_mem_usage reduces CPU RAM pressure during load.
-        model_tmp = AutoModelForCausalLM.from_pretrained(
-            model_dir,
-            trust_remote_code=True,
-            torch_dtype=torch_dtype,
-            low_cpu_mem_usage=True,
-            attn_implementation=attn_impl,
-            device_map=None,
-        )
+            
+        with init_empty_weights():
+            empty_model = AutoModelForCausalLM.from_pretrained(
+                model_dir,
+                trust_remote_code=True,
+                torch_dtype=torch_dtype,
+                attn_implementation=attn_impl,
+            )
 
         balanced_mem = get_balanced_memory(
-            model_tmp,
+            empty_model,
             max_memory=max_memory,
             dtype=torch_dtype,
             low_zero=balanced_low_0,
         )
 
         inferred_map = infer_auto_device_map(
-            model_tmp,
+            empty_model,
             max_memory=balanced_mem,
-            # Try common decoder layer class names; harmless if not present.
             no_split_module_classes=["Qwen2DecoderLayer", "Qwen2.5DecoderLayer", "DecoderLayer"],
         )
 
-        # Hard check: must be FULL GPU.
         bad = [(k, v) for k, v in inferred_map.items() if v in ("cpu", "disk")]
         if bad:
             raise RuntimeError(
@@ -220,7 +198,6 @@ class ProtocolRunner:
                 "  3) Use quantized weights (int8/int4) but still GPU-only\n"
             )
 
-        # Load again with the inferred all-GPU device_map.
         self.model = AutoModelForCausalLM.from_pretrained(
             model_dir,
             trust_remote_code=True,
@@ -234,7 +211,6 @@ class ProtocolRunner:
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        # Print for verification (optional).
         dev = next(self.model.parameters()).device
         print(f"[Init] first param device: {dev}")
         if hasattr(self.model, "hf_device_map"):
@@ -242,15 +218,6 @@ class ProtocolRunner:
 
     def _wrap_prompt(self, query: str) -> str:
         return infer_prompt + f"\n<user_query>{query}</user_query>\n"
-
-    @staticmethod
-    def _print_interrupt(idx: int, reason: str, texts: List[str]) -> None:
-        print("\n" + "=" * 60)
-        print(f"INTERRUPT #{idx}")
-        print(f"Trigger: {reason}")
-        print("Current Output:")
-        print("".join(texts))
-        print("=" * 60 + "\n", flush=True)
 
     @staticmethod
     def _parse_actions_from_pending(pending: str) -> Tuple[List[Tuple[str, str]], str]:
@@ -291,15 +258,91 @@ class ProtocolRunner:
         return m.group(1) if m else ""
 
     @staticmethod
+    def _strip_path_markers(text: str) -> str:
+        text = re.sub(r"\[/?path[^\]]*\]", "", text, flags=re.IGNORECASE)
+        return text.strip()
+
+    @staticmethod
     def _delete_prev_model_action(traj: List[Dict[str, str]]) -> None:
         """
-        Delete the most recent MODEL action before the current one (skip OBS),
-        used for summary/backtrack semantics.
+        Delete the MODEL action immediately BEFORE the last MODEL action.
+        Used for <summary> / <backtrack>.
         """
-        for j in range(len(traj) - 2, -1, -1):
-            if traj[j]["kind"] == "MODEL":
-                traj.pop(j)
-                return
+        for i in range(len(traj) - 2, -1, -1):
+            if traj[i]["kind"] == "MODEL":
+                traj.pop(i)
+                break
+            else:
+                traj.pop(i)
+
+    def _run_parallel_search_paths(
+        self,
+        prefix_text: str,
+    ) -> Tuple[str, str]:
+        cfg = self.search_cfg
+        device = self.model.device
+
+        enc = self.tokenizer([prefix_text], return_tensors="pt", padding=True, padding_side="left")
+        prefix_ids = enc.input_ids.to(device, non_blocking=True)
+        prefix_mask = enc.attention_mask.to(device, non_blocking=True)
+        prefix_len = prefix_ids.size(1)
+
+
+        stopper = ActionTagStoppingCriteria(
+                tokenizer=self.tokenizer,
+                stop_tags=STOP_TAGS_FOR_STOPPING,
+                max_prefix_ws=2,
+                max_suffix_nl=2,
+                include_crlf=True,
+            )
+
+        with torch.inference_mode():
+            out = self.model.generate(
+                input_ids=prefix_ids,
+                attention_mask=prefix_mask,
+                max_new_tokens=cfg.max_new_tokens,
+                do_sample=True,
+                temperature=cfg.temperature,
+                top_p=cfg.top_p,
+                num_return_sequences=cfg.num_paths,
+                repetition_penalty=cfg.repetition_penalty,
+                no_repeat_ngram_size=cfg.no_repeat_ngram_size,
+                pad_token_id=self.tokenizer.pad_token_id,
+                stopping_criteria=StoppingCriteriaList([stopper]),
+                use_cache=True,
+            )
+
+        search_lines: List[str] = []
+        obs_lines: List[str] = []
+
+        for idx in range(out.size(0)):
+            full_seq = out[idx]
+            gen_part = full_seq[prefix_len:]
+            gen_text = self.tokenizer.decode(gen_part, skip_special_tokens=False)
+
+            end_idx = gen_text.find("</search>")
+            if end_idx != -1:
+                gen_text = gen_text[:end_idx]
+
+            gen_text = self._strip_path_markers(gen_text)
+
+            if "<search>" in gen_text:
+                gen_text = gen_text.split("<search>")[-1].strip()
+
+            path_name = f"path{idx + 1}"
+            search_lines.append(f"[{path_name}] {gen_text} [/{path_name}]")
+
+            try:
+                obs = Search(gen_text)
+            except Exception as exc:
+                obs = f"Error: {exc}"
+            
+            obs = self._strip_path_markers(str(obs))
+            obs_lines.append(f"[{path_name}] {obs} [/{path_name}]")
+
+        final_search_block = "<search>\n" + "\n".join(search_lines) + "\n</search>"
+        final_obs_block = "<observation>\n" + "\n".join(obs_lines) + "\n</observation>\n"
+        return final_search_block, final_obs_block
 
     def Generate(self, query: str, N: int, gen_cfg: Optional[GenConfig] = None) -> str:
         if gen_cfg is None:
@@ -311,30 +354,31 @@ class ProtocolRunner:
         traj: List[Dict[str, str]] = []
         pending_text = ""
         interruptions = 0
+        
+        stopper = ActionTagStoppingCriteria(
+                tokenizer=self.tokenizer,
+                stop_tags=STOP_TAGS_FOR_STOPPING,
+                max_prefix_ws=2,
+                max_suffix_nl=2,
+                include_crlf=True,
+            )
+        stopping = StoppingCriteriaList([stopper])
 
         def traj_texts() -> List[str]:
             return [x["text"] for x in traj]
 
         while True:
             if interruptions >= N:
-                # return what we have (including any incomplete tail)
                 return "".join(traj_texts()) + pending_text
-
+            
+            interruptions += 1
             prompt_text = base_context + "".join(traj_texts()) + pending_text
+            print(f"ITER-{interruptions}:\n {prompt_text}")
 
             inputs = self.tokenizer(prompt_text, return_tensors="pt")
             input_ids = inputs["input_ids"].to(self.model.device, non_blocking=True)
             attention_mask = inputs["attention_mask"].to(self.model.device, non_blocking=True)
             input_len = input_ids.shape[1]
-
-            stopper = ActionTagStoppingCriteria(
-                tokenizer=self.tokenizer,
-                stop_tags=STOP_STRS,
-                max_prefix_ws=2,
-                max_suffix_nl=2,
-                include_crlf=True,
-            )
-            stopping = StoppingCriteriaList([stopper])
 
             with torch.inference_mode():
                 gen_kwargs = dict(
@@ -352,52 +396,37 @@ class ProtocolRunner:
                 out_ids = self.model.generate(**gen_kwargs)
 
             decoded = self.tokenizer.decode(out_ids[0][input_len:], skip_special_tokens=False)
-
-            # Accumulate then parse complete actions
+            
             pending_text += decoded
+            
             new_actions, pending_text = self._parse_actions_from_pending(pending_text)
-
-            if not new_actions:
-                interruptions += 1
-                self._print_interrupt(interruptions, "NO_COMPLETE_ACTION", traj_texts() + [pending_text])
-                continue
-
-            # Process all parsed actions in order
+            
             for tag, full_text in new_actions:
                 traj.append({"kind": "MODEL", "tag": tag, "text": full_text})
 
                 if tag == "answer":
                     return "".join(traj_texts())
 
-                if tag == "search":
-                    payload = self._extract_tag_payload(full_text, "search")
-                    tool_result = Search(payload)
-                    traj.append({
-                        "kind": "OBS",
-                        "tag": "observation",
-                        "text": f"\n<observation>\n{tool_result}\n</observation>\n"
-                    })
-                    interruptions += 1
-                    self._print_interrupt(interruptions, "</search>", traj_texts())
-                    break  # go back to generation loop
-
                 if tag in ("summary", "backtrack"):
                     self._delete_prev_model_action(traj)
-                    interruptions += 1
-                    self._print_interrupt(interruptions, f"</{tag}>", traj_texts())
-                    break  # go back to generation loop
+                    break
 
-            else:
-                # No control action in this batch (rare). Continue.
-                interruptions += 1
-                self._print_interrupt(interruptions, "BATCH_NO_CONTROL_TAG", traj_texts())
-                continue
+            open_pos = pending_text.find("<search>")
+            if open_pos != -1:
+                prefix_for_search = base_context + "".join(traj_texts()) + pending_text[:open_pos] + "<search>"
+                final_search_block, final_obs_block = self._run_parallel_search_paths(prefix_for_search)
+
+                traj.append({"kind": "MODEL", "tag": "search", "text": final_search_block})
+                traj.append({"kind": "OBS", "tag": "observation", "text": final_obs_block})
+
+                pending_text = ""
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model_dir", type=str, default="Path To Model")
+    ap.add_argument("--model_dir", type=str, default="/root/zzx/models/Qwen2.5-7B-Instruct")
     ap.add_argument("--N", type=int, default=8, help="最大中断次数")
+
     ap.add_argument("--max_new_tokens", type=int, default=256)
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--top_p", type=float, default=0.9)
@@ -406,7 +435,25 @@ def main():
     ap.add_argument("--attn_impl", type=str, default="sdpa", choices=["sdpa", "flash_attention_2", "eager"])
     ap.add_argument("--reserve_gib", type=float, default=1.5, help="per-GPU VRAM reserve in GiB")
     ap.add_argument("--balanced_low_0", action="store_true", help="accelerate low_zero mode")
+
+    # parallel search knobs
+    ap.add_argument("--search_paths", type=int, default=3)
+    ap.add_argument("--search_max_new_tokens", type=int, default=96)
+    ap.add_argument("--search_temperature", type=float, default=1.0)
+    ap.add_argument("--search_top_p", type=float, default=0.5)
+    ap.add_argument("--search_repetition_penalty", type=float, default=1.1)
+    ap.add_argument("--search_no_repeat_ngram", type=int, default=3)
+
     args = ap.parse_args()
+
+    search_cfg = SearchConfig(
+        num_paths=args.search_paths,
+        max_new_tokens=args.search_max_new_tokens,
+        temperature=args.search_temperature,
+        top_p=args.search_top_p,
+        repetition_penalty=args.search_repetition_penalty,
+        no_repeat_ngram_size=args.search_no_repeat_ngram,
+    )
 
     runner = ProtocolRunner(
         model_dir=args.model_dir,
@@ -414,6 +461,7 @@ def main():
         attn_impl=args.attn_impl,
         reserve_gib=args.reserve_gib,
         balanced_low_0=args.balanced_low_0,
+        search_cfg=search_cfg,
     )
 
     gen_cfg = GenConfig(
