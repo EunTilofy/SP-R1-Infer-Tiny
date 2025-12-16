@@ -13,15 +13,6 @@ from transformers import (
 
 from prompts import infer_prompt
 
-try:
-    from accelerate import infer_auto_device_map, init_empty_weights
-    from accelerate.utils import get_balanced_memory
-except Exception as e:
-    raise ImportError(
-        "This script requires accelerate. Please install it via:\n"
-        "  pip install accelerate\n"
-    ) from e
-
 STOP_TAGS_FOR_STOPPING = ["<search>", "</search>", "</backtrack>", "</summary>", "</answer>"]
 CLOSE_TAGS = ["</search>", "</backtrack>", "</summary>", "</answer>"]
 
@@ -30,20 +21,6 @@ MODEL_TAGS = ["think", "answer", "summary", "backtrack", "search"]
 
 def Search(_: str) -> str:
     return "Cannot Search Now"
-
-
-def configure_tf32_no_deprecated_warning() -> None:
-    if not torch.cuda.is_available():
-        return
-    try:
-        torch.backends.cuda.matmul.fp32_precision = "tf32"
-        torch.backends.cudnn.conv.fp32_precision = "tf32"
-    except Exception:
-        pass
-    try:
-        torch.set_float32_matmul_precision("high")
-    except Exception:
-        pass
 
 
 class ActionTagStoppingCriteria(StoppingCriteria):
@@ -127,16 +104,11 @@ class ProtocolRunner:
     def __init__(
         self,
         model_dir: str,
-        dtype: str = "bf16",
         attn_impl: str = "sdpa",
-        reserve_gib: float = 1.5,
-        balanced_low_0: bool = False,
         search_cfg: Optional[SearchConfig] = None,
     ):
         self.model_dir = model_dir
         self.search_cfg = search_cfg or SearchConfig()
-
-        configure_tf32_no_deprecated_warning()
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_dir,
@@ -144,77 +116,22 @@ class ProtocolRunner:
             use_fast=True,
         )
 
-        if dtype == "auto":
-            torch_dtype = None
-        elif dtype == "bf16":
-            torch_dtype = torch.bfloat16
-        elif dtype == "fp16":
-            torch_dtype = torch.float16
-        elif dtype == "fp32":
-            torch_dtype = torch.float32
-        else:
-            raise ValueError(f"Unknown dtype: {dtype}")
-
-        n_gpu = torch.cuda.device_count()
-        if n_gpu == 0:
-            raise RuntimeError("No CUDA device found, cannot run fully on GPU.")
-
-        reserve = int(reserve_gib * 1024**3)
-        max_memory: Dict[int, int] = {}
-        for i in range(n_gpu):
-            total = torch.cuda.get_device_properties(i).total_memory
-            avail = max(total - reserve, int(0.5 * 1024**3))
-            max_memory[i] = avail
-            
-        with init_empty_weights():
-            empty_model = AutoModelForCausalLM.from_pretrained(
-                model_dir,
-                trust_remote_code=True,
-                torch_dtype=torch_dtype,
-                attn_implementation=attn_impl,
-            )
-
-        balanced_mem = get_balanced_memory(
-            empty_model,
-            max_memory=max_memory,
-            dtype=torch_dtype,
-            low_zero=balanced_low_0,
-        )
-
-        inferred_map = infer_auto_device_map(
-            empty_model,
-            max_memory=balanced_mem,
-            no_split_module_classes=["Qwen2DecoderLayer", "Qwen2.5DecoderLayer", "DecoderLayer"],
-        )
-
-        bad = [(k, v) for k, v in inferred_map.items() if v in ("cpu", "disk")]
-        if bad:
-            raise RuntimeError(
-                "FULL-GPU requirement not satisfied: some modules would be placed on cpu/disk.\n"
-                f"Offloaded modules: {bad}\n"
-                "Fix options:\n"
-                "  1) Free GPU memory / close other GPU jobs\n"
-                "  2) Reduce reserve_gib (careful about OOM)\n"
-                "  3) Use quantized weights (int8/int4) but still GPU-only\n"
-            )
+        if torch.cuda.device_count() == 0:
+            raise RuntimeError("No CUDA device found, cannot run on GPU.")
 
         self.model = AutoModelForCausalLM.from_pretrained(
             model_dir,
             trust_remote_code=True,
-            torch_dtype=torch_dtype,
             low_cpu_mem_usage=True,
+            dtype=torch.float16,
             attn_implementation=attn_impl,
-            device_map=inferred_map,
-        )
-        self.model.eval()
+            device_map="auto",
+        ).eval()
+
+        self.primary_device = next(self.model.parameters()).device
 
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-
-        dev = next(self.model.parameters()).device
-        print(f"[Init] first param device: {dev}")
-        if hasattr(self.model, "hf_device_map"):
-            print(f"[Init] hf_device_map: {self.model.hf_device_map}")
 
     def _wrap_prompt(self, query: str) -> str:
         return infer_prompt + f"\n<user_query>{query}</user_query>\n"
@@ -275,26 +192,22 @@ class ProtocolRunner:
             else:
                 traj.pop(i)
 
-    def _run_parallel_search_paths(
-        self,
-        prefix_text: str,
-    ) -> Tuple[str, str]:
+    def _run_parallel_search_paths(self, prefix_text: str) -> Tuple[str, str]:
         cfg = self.search_cfg
-        device = self.model.device
+        device = self.primary_device
 
         enc = self.tokenizer([prefix_text], return_tensors="pt", padding=True, padding_side="left")
         prefix_ids = enc.input_ids.to(device, non_blocking=True)
         prefix_mask = enc.attention_mask.to(device, non_blocking=True)
         prefix_len = prefix_ids.size(1)
 
-
         stopper = ActionTagStoppingCriteria(
-                tokenizer=self.tokenizer,
-                stop_tags=STOP_TAGS_FOR_STOPPING,
-                max_prefix_ws=2,
-                max_suffix_nl=2,
-                include_crlf=True,
-            )
+            tokenizer=self.tokenizer,
+            stop_tags=STOP_TAGS_FOR_STOPPING,
+            max_prefix_ws=2,
+            max_suffix_nl=2,
+            include_crlf=True,
+        )
 
         with torch.inference_mode():
             out = self.model.generate(
@@ -336,7 +249,7 @@ class ProtocolRunner:
                 obs = Search(gen_text)
             except Exception as exc:
                 obs = f"Error: {exc}"
-            
+
             obs = self._strip_path_markers(str(obs))
             obs_lines.append(f"[{path_name}] {obs} [/{path_name}]")
 
@@ -350,18 +263,17 @@ class ProtocolRunner:
 
         base_context = self._wrap_prompt(query)
 
-        # traj: list of {"kind": "MODEL"/"OBS", "tag": ..., "text": ...}
         traj: List[Dict[str, str]] = []
         pending_text = ""
         interruptions = 0
-        
+
         stopper = ActionTagStoppingCriteria(
-                tokenizer=self.tokenizer,
-                stop_tags=STOP_TAGS_FOR_STOPPING,
-                max_prefix_ws=2,
-                max_suffix_nl=2,
-                include_crlf=True,
-            )
+            tokenizer=self.tokenizer,
+            stop_tags=STOP_TAGS_FOR_STOPPING,
+            max_prefix_ws=2,
+            max_suffix_nl=2,
+            include_crlf=True,
+        )
         stopping = StoppingCriteriaList([stopper])
 
         def traj_texts() -> List[str]:
@@ -370,14 +282,14 @@ class ProtocolRunner:
         while True:
             if interruptions >= N:
                 return "".join(traj_texts()) + pending_text
-            
+
             interruptions += 1
             prompt_text = base_context + "".join(traj_texts()) + pending_text
             print(f"ITER-{interruptions}:\n {prompt_text}")
 
             inputs = self.tokenizer(prompt_text, return_tensors="pt")
-            input_ids = inputs["input_ids"].to(self.model.device, non_blocking=True)
-            attention_mask = inputs["attention_mask"].to(self.model.device, non_blocking=True)
+            input_ids = inputs["input_ids"].to(self.primary_device, non_blocking=True)
+            attention_mask = inputs["attention_mask"].to(self.primary_device, non_blocking=True)
             input_len = input_ids.shape[1]
 
             with torch.inference_mode():
@@ -396,11 +308,10 @@ class ProtocolRunner:
                 out_ids = self.model.generate(**gen_kwargs)
 
             decoded = self.tokenizer.decode(out_ids[0][input_len:], skip_special_tokens=False)
-            
             pending_text += decoded
-            
+
             new_actions, pending_text = self._parse_actions_from_pending(pending_text)
-            
+
             for tag, full_text in new_actions:
                 traj.append({"kind": "MODEL", "tag": tag, "text": full_text})
 
@@ -431,10 +342,7 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--top_p", type=float, default=0.9)
     ap.add_argument("--no_sample", action="store_true")
-    ap.add_argument("--dtype", type=str, default="bf16", choices=["auto", "bf16", "fp16", "fp32"])
-    ap.add_argument("--attn_impl", type=str, default="sdpa", choices=["sdpa", "flash_attention_2", "eager"])
-    ap.add_argument("--reserve_gib", type=float, default=1.5, help="per-GPU VRAM reserve in GiB")
-    ap.add_argument("--balanced_low_0", action="store_true", help="accelerate low_zero mode")
+    ap.add_argument("--attn_impl", type=str, default="flash_attention_2", choices=["sdpa", "flash_attention_2", "eager"])
 
     # parallel search knobs
     ap.add_argument("--search_paths", type=int, default=3)
@@ -457,10 +365,7 @@ def main():
 
     runner = ProtocolRunner(
         model_dir=args.model_dir,
-        dtype=args.dtype,
         attn_impl=args.attn_impl,
-        reserve_gib=args.reserve_gib,
-        balanced_low_0=args.balanced_low_0,
         search_cfg=search_cfg,
     )
 
